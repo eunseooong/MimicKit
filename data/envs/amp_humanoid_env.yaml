@@ -4,6 +4,7 @@ char_file: "data/assets/humanoid/humanoid.xml"
 camera_mode: "track"
 
 episode_length: 10.0 # seconds
+obs_version: "v1"
 global_obs: True
 root_height_obs: True
 pose_termination: False

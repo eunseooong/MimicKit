@@ -53,7 +53,7 @@ class ViewMotionEnv(char_env.CharEnv):
     def _sync_motion(self):
         motion_ids = self._get_env_motion_ids()
         motion_times = self._time_buf * self._time_scale
-        root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         joint_dof = self._motion_lib.joint_rot_to_dof(joint_rot)
         
         char_id = self._get_char_id()

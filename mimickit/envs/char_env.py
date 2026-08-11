@@ -19,6 +19,7 @@ class CharEnv(sim_env.SimEnv):
         self._global_obs = env_config["global_obs"]
         self._root_height_obs = env_config.get("root_height_obs", True)
         self._zero_center_action = env_config.get("zero_center_action", False)
+        self._obs_version = env_config.get("obs_version", "v1")
         
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize, 
@@ -253,6 +254,17 @@ class CharEnv(sim_env.SimEnv):
     
     def _compute_obs(self, env_ids=None):
         char_id = self._get_char_id()
+
+        if self._obs_version == "v1":
+            obs = self._compute_obs_v1(char_id, env_ids)
+        elif self._obs_version == "v2":
+            obs = self._compute_obs_v2(char_id, env_ids)
+        else:
+            assert False, "Unsupported obs_version: {}".format(self._obs_version)
+
+        return obs
+
+    def _compute_obs_v1(self, char_id, env_ids):
         root_pos = self._engine.get_root_pos(char_id)
         root_rot = self._engine.get_root_rot(char_id)
         root_vel = self._engine.get_root_vel(char_id)
@@ -278,7 +290,7 @@ class CharEnv(sim_env.SimEnv):
             key_pos = torch.zeros([0], device=self._device)
 
         obs = compute_char_obs(root_pos=root_pos,
-                               root_rot=root_rot, 
+                               root_rot=root_rot,
                                root_vel=root_vel,
                                root_ang_vel=root_ang_vel,
                                joint_rot=joint_rot,
@@ -286,6 +298,25 @@ class CharEnv(sim_env.SimEnv):
                                key_pos=key_pos,
                                global_obs=self._global_obs,
                                root_height_obs=self._root_height_obs)
+        return obs
+
+    def _compute_obs_v2(self, char_id, env_ids):
+        body_pos = self._engine.get_body_pos(char_id)
+        body_rot = self._engine.get_body_rot(char_id)
+        body_vel = self._engine.get_body_vel(char_id)
+        body_ang_vel = self._engine.get_body_ang_vel(char_id)
+
+        if (env_ids is not None):
+            body_pos = body_pos[env_ids]
+            body_rot = body_rot[env_ids]
+            body_vel = body_vel[env_ids]
+            body_ang_vel = body_ang_vel[env_ids]
+
+        obs = compute_char_obs_v2(body_pos=body_pos,
+                                  body_rot=body_rot,
+                                  body_vel=body_vel,
+                                  body_ang_vel=body_ang_vel,
+                                  root_height_obs=self._root_height_obs)
         return obs
     
     def _reset_envs(self, env_ids):
@@ -437,6 +468,62 @@ def compute_char_obs(root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_
 
         key_pos_flat = torch.reshape(key_pos, [key_pos.shape[0], key_pos.shape[1] * key_pos.shape[2]])
         obs = obs + [key_pos_flat]
+
+    if (root_height_obs):
+        root_h = root_pos[:, 2:3]
+        obs = [root_h] + obs
+    
+    obs = torch.cat(obs, dim=-1)
+    return obs
+
+@torch.jit.script
+def compute_char_obs_v2(body_pos, body_rot, body_vel, body_ang_vel, root_height_obs,
+    include_local_body_pos: bool = True,
+    include_local_body_rot: bool = True, 
+    include_local_body_vel: bool = True,
+    include_local_body_ang_vel: bool = True,
+):
+    root_pos = body_pos[:, 0, :]
+    root_rot = body_rot[:, 0, :]
+    heading_rot = torch_util.calc_heading_quat_inv(root_rot)
+    
+    obs = []
+    
+    heading_rot_expand = heading_rot.unsqueeze(-2)
+    heading_rot_expand = heading_rot_expand.repeat((1, body_pos.shape[1], 1))
+    flat_heading_rot_expand = heading_rot_expand.reshape(
+        heading_rot_expand.shape[0] * heading_rot_expand.shape[1], heading_rot_expand.shape[2]
+    )
+
+    if include_local_body_pos:
+        root_pos_expand = root_pos.unsqueeze(-2)
+        local_body_pos = body_pos - root_pos_expand
+        flat_local_body_pos = local_body_pos.reshape(local_body_pos.shape[0] * local_body_pos.shape[1], local_body_pos.shape[2])
+        flat_local_body_pos = torch_util.quat_rotate(flat_heading_rot_expand, flat_local_body_pos)
+        local_body_pos = flat_local_body_pos.reshape(local_body_pos.shape[0], local_body_pos.shape[1] * local_body_pos.shape[2])
+        
+        # Only remove root pos if we haven't filtered bodies, or if root is still included
+        # When body_ids is specified, we don't want to remove the first 3 dims as it's not the root
+        obs.append(local_body_pos)
+
+    if include_local_body_rot:
+        flat_body_rot = body_rot.reshape(body_rot.shape[0] * body_rot.shape[1], body_rot.shape[2])
+        flat_local_body_rot = torch_util.quat_mul(flat_heading_rot_expand, flat_body_rot)
+        flat_local_body_rot_obs = torch_util.quat_to_tan_norm(flat_local_body_rot)
+        local_body_rot_obs = flat_local_body_rot_obs.reshape(body_rot.shape[0], body_rot.shape[1] * flat_local_body_rot_obs.shape[1])
+        obs.append(local_body_rot_obs)
+
+    if include_local_body_vel:
+        flat_body_vel = body_vel.reshape(body_vel.shape[0] * body_vel.shape[1], body_vel.shape[2])
+        flat_local_body_vel = torch_util.quat_rotate(flat_heading_rot_expand, flat_body_vel)
+        local_body_vel = flat_local_body_vel.reshape(body_vel.shape[0], body_vel.shape[1] * body_vel.shape[2])
+        obs.append(local_body_vel)
+    
+    if include_local_body_ang_vel:
+        flat_body_ang_vel = body_ang_vel.reshape(body_ang_vel.shape[0] * body_ang_vel.shape[1], body_ang_vel.shape[2])
+        flat_local_body_ang_vel = torch_util.quat_rotate(flat_heading_rot_expand, flat_body_ang_vel)
+        local_body_ang_vel = flat_local_body_ang_vel.reshape(body_ang_vel.shape[0], body_ang_vel.shape[1] * body_ang_vel.shape[2])
+        obs.append(local_body_ang_vel)
 
     if (root_height_obs):
         root_h = root_pos[:, 2:3]

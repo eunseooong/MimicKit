@@ -75,6 +75,15 @@ class MotionLib():
         root_vel = self._frame_root_vel[frame_idx0]
         root_ang_vel = self._frame_root_ang_vel[frame_idx0]
 
+        body_pos0 = self._frame_body_pos[frame_idx0]
+        body_pos1 = self._frame_body_pos[frame_idx1]
+
+        body_rot0 = self._frame_body_rot[frame_idx0]
+        body_rot1 = self._frame_body_rot[frame_idx1]
+
+        body_vel = self._frame_body_vel[frame_idx0]
+        body_ang_vel = self._frame_body_ang_vel[frame_idx0]
+
         joint_rot0 = self._frame_joint_rot[frame_idx0]
         joint_rot1 = self._frame_joint_rot[frame_idx1]
 
@@ -84,12 +93,15 @@ class MotionLib():
         root_pos = (1.0 - blend_unsq) * root_pos0 + blend_unsq * root_pos1
         root_rot = torch_util.slerp(root_rot0, root_rot1, blend)
         
+        body_pos = (1.0 - blend_unsq.unsqueeze(-1)) * body_pos0 + blend_unsq.unsqueeze(-1) * body_pos1
+        body_rot = torch_util.slerp(body_rot0, body_rot1, blend_unsq)
+    
         joint_rot = torch_util.slerp(joint_rot0, joint_rot1, blend_unsq)
 
         root_pos_offset = self._calc_loop_offset(motion_ids, motion_times)
         root_pos += root_pos_offset
 
-        return root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel
+        return root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel
 
     def joint_rot_to_dof(self, joint_rot):
         joint_dof = self._kin_char_model.rot_to_dof(joint_rot)
@@ -118,7 +130,9 @@ class MotionLib():
         joint_rot = self._kin_char_model.dof_to_rot(joint_dof)
         joint_rot = torch_util.quat_pos(joint_rot)
 
-        return root_pos, root_rot_quat, joint_rot
+        body_pos, body_rot = self._kin_char_model.forward_kinematics(root_pos, root_rot_quat, joint_rot) 
+
+        return root_pos, root_rot_quat, joint_rot, body_pos, body_rot
 
     def _calc_frame_blend(self, motion_ids, times):
         num_frames = self._motion_num_frames[motion_ids]
@@ -145,7 +159,6 @@ class MotionLib():
 
         root_pos_offset = phase * wrap_deltas
         return root_pos_offset
-    
 
     def _load_motions(self, motion_file):
         self._load_motion_pkl(motion_file)
@@ -182,6 +195,15 @@ class MotionLib():
         self._frame_root_ang_vel[..., :-1, :] = frame_fps[:-1] * torch_util.quat_to_exp_map(root_drot)
         self._frame_root_ang_vel[..., motion_end_idx, :] = self._frame_root_ang_vel[..., motion_end_idx - 1, :]
 
+        self._frame_body_vel = torch.zeros_like(self._frame_body_pos)
+        self._frame_body_vel[..., :-1, :, :] = frame_fps[:-1].unsqueeze(-1) * (self._frame_body_pos[..., 1:, :, :] - self._frame_body_pos[..., :-1, :, :])
+        self._frame_body_vel[..., motion_end_idx, :, :] = self._frame_body_vel[..., motion_end_idx - 1, :, :]
+
+        self._frame_body_ang_vel = torch.zeros_like(self._frame_body_pos)
+        body_drot = torch_util.quat_diff(self._frame_body_rot[..., :-1, :, :], self._frame_body_rot[..., 1:, :, :])
+        self._frame_body_ang_vel[..., :-1, :, :] = frame_fps[:-1].unsqueeze(-1) * torch_util.quat_to_exp_map(body_drot)
+        self._frame_body_ang_vel[..., motion_end_idx, :, :] = self._frame_body_ang_vel[..., motion_end_idx - 1, :, :]
+
         frame_dt = 1.0 / frame_fps
         self._frame_dof_vel = self._kin_char_model.compute_frame_dof_vel(self._frame_joint_rot, frame_dt[:-1])
         self._frame_dof_vel[..., motion_end_idx, :] = self._frame_dof_vel[..., motion_end_idx - 1, :]
@@ -193,7 +215,18 @@ class MotionLib():
 
         nonwrap_motions = self._motion_loop_modes != motion.LoopMode.WRAP.value
         self._motion_wrap_delta[nonwrap_motions] = 0.0
+
+        self._motion_type_ids = torch.tensor(
+            self._motion_type_ids_raw, dtype=torch.long, device=self._device)
+        self._num_motion_types = int(self._motion_type_ids.max().item()) + 1
         return
+
+    def get_num_motion_types(self):
+        return self._num_motion_types
+
+    def get_motion_type(self, motion_ids):
+        """Return integer type IDs for the given motion indices."""
+        return self._motion_type_ids[motion_ids]
 
     def _fetch_motion_files(self, motion_file):
         ext = os.path.splitext(motion_file)[1]
@@ -239,7 +272,11 @@ class MotionLib():
         
         self._frame_root_pos = []
         self._frame_root_rot = []
+        self._frame_body_pos = []
+        self._frame_body_rot = []
         self._frame_joint_rot = []
+        self._frame_labels = []
+        self._motion_type_ids_raw = []  # raw int ID per motion (0 = unknown/unset)
 
         motion_files, motion_weights = self._fetch_motion_files(motion_file)
         num_motion_files = len(motion_files)
@@ -254,8 +291,8 @@ class MotionLib():
             loop_mode = curr_motion.loop_mode.value
             frames = curr_motion.frames
             num_frames = frames.shape[0]
-            
-            root_pos, root_rot, joint_rot = self._extract_frame_data(frames)
+
+            root_pos, root_rot, joint_rot, body_pos, body_rot = self._extract_frame_data(frames)
 
             self._motion_files.append(curr_file)
             self._motion_weights.append(curr_weight)
@@ -266,6 +303,18 @@ class MotionLib():
             self._frame_root_pos.append(root_pos)
             self._frame_root_rot.append(root_rot)
             self._frame_joint_rot.append(joint_rot)
+            self._frame_body_pos.append(body_pos)
+            self._frame_body_rot.append(body_rot)
+
+            # Per-frame beat labels (cos, sin): zeros when absent (motion not preprocessed).
+            if curr_motion.labels is not None:
+                labels_t = torch.tensor(curr_motion.labels, dtype=torch.float32, device=self._device)
+            else:
+                labels_t = torch.zeros(num_frames, 2, dtype=torch.float32, device=self._device)
+            self._frame_labels.append(labels_t)
+
+            type_id = curr_motion.motion_type_id
+            self._motion_type_ids_raw.append(int(type_id) if type_id is not None else 0)
 
         self._motion_weights = torch.tensor(self._motion_weights, dtype=torch.float32, device=self._device)
         self._motion_fps = torch.tensor(self._motion_fps, dtype=torch.float32, device=self._device)
@@ -275,4 +324,7 @@ class MotionLib():
         self._frame_root_pos = torch.cat(self._frame_root_pos, dim=0)
         self._frame_root_rot = torch.cat(self._frame_root_rot, dim=0)
         self._frame_joint_rot = torch.cat(self._frame_joint_rot, dim=0)
+        self._frame_body_pos = torch.cat(self._frame_body_pos, dim=0)
+        self._frame_body_rot = torch.cat(self._frame_body_rot, dim=0)
+        self._frame_labels = torch.cat(self._frame_labels, dim=0)
         return

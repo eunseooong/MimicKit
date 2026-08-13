@@ -178,7 +178,7 @@ class DeepMimicEnv(char_env.CharEnv):
         self._motion_ids[env_ids] = motion_ids
         self._motion_time_offsets[env_ids] = motion_times
 
-        root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
 
         self._ref_root_pos[env_ids] = root_pos
         self._ref_root_rot[env_ids] = root_rot
@@ -232,7 +232,7 @@ class DeepMimicEnv(char_env.CharEnv):
     def _update_ref_motion(self):
         motion_ids = self._motion_ids
         motion_times = self._get_motion_times()
-        root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         
         self._ref_root_pos[:] = root_pos
         self._ref_root_rot[:] = root_rot
@@ -572,7 +572,7 @@ class DeepMimicEnv(char_env.CharEnv):
 
         motion_ids_tiled = motion_ids_tiled.flatten()
         motion_times = motion_times.flatten()
-        root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids_tiled, motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids_tiled, motion_times)
         
         root_pos = root_pos.reshape([n, num_steps, root_pos.shape[-1]])
         root_rot = root_rot.reshape([n, num_steps, root_rot.shape[-1]])

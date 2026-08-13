@@ -75,7 +75,7 @@ class AMPEnv(deepmimic_env.DeepMimicEnv):
 
         motion_ids = motion_ids.view(-1)
         motion_times = motion_times.view(-1)
-        root_pos, root_rot, root_vel, root_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
+        root_pos, root_rot, root_vel, root_ang_vel, body_pos, body_rot, body_vel, body_ang_vel, joint_rot, dof_vel = self._motion_lib.calc_motion_frame(motion_ids, motion_times)
         
         body_pos, _ = self._kin_char_model.forward_kinematics(root_pos, root_rot, joint_rot)
 

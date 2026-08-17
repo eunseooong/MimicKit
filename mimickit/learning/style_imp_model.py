@@ -27,7 +27,16 @@ class StyleImpModel(ppo_model.PPOModel):
         one for the optimizer, because 69 target dims act on the reward far more directly than 23
         gain dims that can only rescale a load-determined deviation. Use this only together with
         pose_style_reg_weight, and watch pose_style_ratio.
+
+    "obs_style" -- no structural separation at all. One trunk over [obs ; style], one distribution
+        over the whole action: this is the stock DeepMimic actor with the style appended to the
+        observation. The style reaches the pd targets directly, so pose_style_reg_weight is the
+        *only* thing holding the factorization together. Weakest prior, hardest test of the
+        penalty, and with the weight at zero it is the honest baseline that shows what the
+        optimizer does when nothing stops it.
     """
+
+    POSE_INPUTS = ["phase", "obs", "obs_style"]
 
     def __init__(self, config, env):
         self._pose_size = env.get_pose_action_size()
@@ -37,7 +46,7 @@ class StyleImpModel(ppo_model.PPOModel):
 
         assert(self._imp_size > 0), "StyleImp requires an env with impedance_mode enabled"
         assert(self._pose_size + self._imp_size == np.prod(env.get_action_space().shape))
-        assert(self._pose_input in ["phase", "obs"]), \
+        assert(self._pose_input in self.POSE_INPUTS), \
             "Unsupported pose_input: {}".format(self._pose_input)
 
         if (self._pose_input == "phase"):
@@ -46,7 +55,15 @@ class StyleImpModel(ppo_model.PPOModel):
         super().__init__(config, env)
         return
 
+    def is_joint_actor(self):
+        # one trunk and one head over everything, no routing
+        return (self._pose_input == "obs_style")
+
     def eval_actor(self, obs, style):
+        if (self.is_joint_actor()):
+            h = self._actor_layers(torch.cat([obs, style], dim=-1))
+            return self._full_dist(h)
+
         h = self._actor_layers(obs)
 
         pose_dist = self._pose_dist(self._eval_pose_feat(obs, h))
@@ -60,8 +77,13 @@ class StyleImpModel(ppo_model.PPOModel):
         a_dist = distribution_gaussian_diag.DistributionGaussianDiag(mean=mean, logstd=logstd)
         return a_dist
 
-    def eval_pose(self, obs):
-        # pd targets on their own, for the invariance penalty and the diagnostics
+    def eval_pose(self, obs, style):
+        """The pd targets on their own, for the invariance penalty and the diagnostics. style is
+        accepted in every mode but only reaches the targets when pose_input is "obs_style"."""
+        if (self.is_joint_actor()):
+            h = self._actor_layers(torch.cat([obs, style], dim=-1))
+            return self._full_dist(h).mode[..., :self._pose_size]
+
         if (self._pose_input == "phase"):
             feat = self._eval_pose_feat(obs, None)
         else:
@@ -80,6 +102,9 @@ class StyleImpModel(ppo_model.PPOModel):
         return val
 
     def get_actor_params(self):
+        if (self.is_joint_actor()):
+            return list(self._actor_layers.parameters()) + list(self._full_dist.parameters())
+
         params = list(self._actor_layers.parameters()) \
                  + list(self._pose_dist.parameters()) \
                  + list(self._imp_layers.parameters()) \
@@ -95,6 +120,12 @@ class StyleImpModel(ppo_model.PPOModel):
                                                       activation=self._activation)
 
         trunk_size = torch_util.calc_layers_out_size(self._actor_layers)
+
+        if (self.is_joint_actor()):
+            # stock actor: one head over the whole action, nothing routed anywhere
+            self._full_dist = self._build_head_dist(config, trunk_size,
+                                                    self._pose_size + self._imp_size)
+            return
 
         if (self._pose_input == "phase"):
             # the pose head gets its own net, it must not touch the trunk because the trunk reads
@@ -130,6 +161,13 @@ class StyleImpModel(ppo_model.PPOModel):
             in_size, out_size, std_type=std_type, init_std=init_std,
             init_output_scale=init_output_scale)
         return a_dist
+
+    def _build_actor_input_dict(self, env):
+        input_dict = {"obs": env.get_obs_space()}
+        if (self.is_joint_actor()):
+            # the style has to enter somewhere, and here it enters the trunk with everything else
+            input_dict["style"] = self._build_style_space()
+        return input_dict
 
     def _build_critic_input_dict(self, env):
         # the value of a state depends on which style is being tracked, so the critic sees it

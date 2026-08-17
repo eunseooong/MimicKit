@@ -46,3 +46,4 @@ action_reg_weight: 0.0
 pose_style_reg_weight: 0.0
 pose_style_reg_bins: 20
 pose_style_reg_min_count: 2
+pose_style_reg_normalize: True

@@ -1,0 +1,9 @@
+--logger tb
+
+--num_envs 2048
+
+--engine_config data/engines/isaac_lab_pd_engine.yaml
+--env_config data/envs/style_imp_smpl_env.yaml
+--agent_config data/agents/style_imp_soft_smpl_agent.yaml
+
+--out_dir output/style_imp_soft/

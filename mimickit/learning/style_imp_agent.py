@@ -19,6 +19,7 @@ class StyleImpAgent(ppo_agent.PPOAgent):
         self._pose_style_reg_weight = config.get("pose_style_reg_weight", 0.0)
         self._pose_style_reg_bins = config.get("pose_style_reg_bins", 20)
         self._pose_style_reg_min_count = config.get("pose_style_reg_min_count", 2)
+        self._pose_style_reg_normalize = config.get("pose_style_reg_normalize", True)
         return
 
     def _build_model(self, config):
@@ -69,18 +70,37 @@ class StyleImpAgent(ppo_agent.PPOAgent):
         return
 
     def _compute_pose_style_reg(self, norm_obs, style, phase):
-        """Soft stand-in for restricting the pose head to the phase, penalizes the spread of the
-        pd targets across styles within a phase bin."""
-        pose = self._model.eval_pose(norm_obs)
-        return self._calc_pose_style_var(pose, style, phase)
+        """Soft stand-in for restricting the pose head to the phase: penalizes the disagreement
+        between the pd targets of different styles at the same point in the motion.
+
+        Normalizing by the spread of the targets over the whole motion keeps wide-range joints from
+        dominating, puts the loss on the same [0, ~1] scale as the reported pose_style_ratio, and
+        so lets the weight carry over between motions and configs.
+
+        It does NOT rule out the degenerate minimum. Collapsing q* to a constant zeroes the
+        numerator and the denominator together, and the ratio goes to zero just like the raw
+        variance does, so both forms reward a policy that stops moving. Only the tracking reward
+        pushes back on that; watch pose_var in the diagnostics to catch it.
+        """
+        pose = self._model.eval_pose(norm_obs, style)
+        style_var = self._calc_pose_style_var(pose, style, phase)
+        if (style_var is None):
+            return None
+
+        if (self._pose_style_reg_normalize):
+            total_var = torch.var(pose, dim=0).detach()
+            return torch.mean(style_var / torch.clamp_min(total_var, 1e-6))
+        return torch.sum(style_var)
 
     def _calc_pose_style_var(self, pose, style, phase):
-        """Mean cross-style variance of the pd targets within a phase bin.
+        """Per-dim cross-style variance of the pd targets within a phase bin, averaged over bins.
+        Returns None when no bin holds at least two styles. Shape is (num_pose_dims,).
 
         The styles are assumed phase aligned, so samples in the same phase bin are at the same
         point of the motion regardless of style, and any disagreement between their pd targets is
-        style information that leaked in through the observation. Binning by phase is essential:
-        comparing per-style means over the whole motion averages the leak away.
+        style information the policy should not be using. Binning by phase is essential: comparing
+        per-style means over the whole motion averages the leak away and reports a healthy number
+        for a broken policy.
         """
         num_bins = self._pose_style_reg_bins
         num_styles = self._env.get_num_styles()
@@ -99,21 +119,20 @@ class StyleImpAgent(ppo_agent.PPOAgent):
         valid = counts >= self._pose_style_reg_min_count
         means = sums / torch.clamp_min(counts, 1.0).unsqueeze(-1)
         means = means.reshape([num_bins, num_styles, -1])
-        valid = valid.reshape([num_bins, num_styles])
+        valid = valid.reshape([num_bins, num_styles]).type(pose.dtype).unsqueeze(-1)
 
         # a bin only contributes if at least two styles are represented in it, otherwise there is
         # nothing to compare and the variance is meaningless
-        valid_f = valid.type(pose.dtype).unsqueeze(-1)
-        num_valid = valid_f.sum(dim=1, keepdim=True)
-        bin_mask = (num_valid.squeeze(-1).squeeze(-1) >= 2)
-
-        bin_mean = (means * valid_f).sum(dim=1, keepdim=True) / torch.clamp_min(num_valid, 1.0)
-        sq_dev = torch.square(means - bin_mean) * valid_f
-        bin_var = sq_dev.sum(dim=1).sum(dim=-1) / torch.clamp_min(num_valid.squeeze(-1).squeeze(-1), 1.0)
-
+        num_valid = valid.sum(dim=1, keepdim=True)
+        bin_mask = (num_valid.reshape(-1) >= 2)
         if (not torch.any(bin_mask)):
             return None
-        return torch.mean(bin_var[bin_mask])
+
+        bin_mean = (means * valid).sum(dim=1, keepdim=True) / torch.clamp_min(num_valid, 1.0)
+        sq_dev = torch.square(means - bin_mean) * valid
+        bin_var = sq_dev.sum(dim=1) / torch.clamp_min(num_valid.squeeze(1), 1.0)
+
+        return torch.mean(bin_var[bin_mask], dim=0)
 
     def _build_train_data(self):
         self.eval()
@@ -273,19 +292,26 @@ class StyleImpAgent(ppo_agent.PPOAgent):
             # trajectory, a large one means the style leaked in through the observation
             phase = self._exp_buffer.get_data_flat("phase")
             norm_obs = self._obs_norm.normalize(obs)
-            pose = torch_util.eval_minibatch(self._model.eval_pose, {"obs": norm_obs},
+            pose = torch_util.eval_minibatch(self._model.eval_pose,
+                                             {"obs": norm_obs, "style": style},
                                              self._critic_eval_batch_size)
+
+            # total spread of the targets. the invariance penalty is minimized by a q* that never
+            # moves, so this has to be watched alongside the ratio: a ratio that improves while
+            # this collapses means the policy bought invariance by standing still
+            pose_var_dim = torch.var(pose, dim=0)
 
             pose_style_var = self._calc_pose_style_var(pose, style, phase)
             if (pose_style_var is None):
                 pose_style_ratio = 0.0
             else:
-                pose_var = torch.sum(torch.var(pose, dim=0))
-                pose_style_ratio = (pose_style_var / torch.clamp_min(pose_var, 1e-8)).item()
+                pose_style_ratio = torch.mean(
+                    pose_style_var / torch.clamp_min(pose_var_dim, 1e-6)).item()
 
             info = {
                 "gain_mean_abs": torch.mean(torch.abs(gain)).item(),
                 "gain_at_bound": torch.mean(at_bound).item(),
                 "pose_style_ratio": pose_style_ratio,
+                "pose_var": torch.mean(pose_var_dim).item(),
             }
         return info

@@ -17,6 +17,7 @@ Framing borrowed from motor control: the PD target is a **virtual equilibrium tr
 | StyleImp model/agent (shared trunk, style → impedance head only) | implemented, structurally verified |
 | Phase-only pose head (`pose_input: "phase"`) | implemented, exact invariance verified |
 | Soft invariance penalty (`pose_style_reg_weight`) | implemented, verified on synthetic data |
+| `pose_input: "obs_style"` — no structural separation, penalty only (experiment 2) | implemented, structurally verified |
 | **Runtime / simulator testing** | **never run** — no Isaac Lab installed in the dev environment |
 | Offline feasibility test (rank-1, see below) | **not done** — recommended before trusting any training result |
 
@@ -91,10 +92,13 @@ The single combined distribution is deliberate: `log_prob`, PPO clipping, and `_
 
 `pose_input` decides what the pose head may see, and it is the whole experiment:
 
-| `pose_input` | Pose head input | Guarantee | Cost |
+| `pose_input` | Actor shape | Pose head input | Guarantee |
 |---|---|---|---|
-| `"phase"` | phase encoding only | **exact** — identical `q*` across styles at equal phase, `Δq* = 0` and `d(q*)/d(trunk) = 0` *(measured)* | no state feedback in the pose path, cannot share the trunk |
-| `"obs"` | full obs via the shared trunk | **none** — see below | trains more easily, needs `pose_style_reg_weight` |
+| `"phase"` | pose head + imp head, style → imp head only | phase encoding only | **exact** — `Δq* = 0`, `d(q*)/d(trunk) = 0` *(measured)* |
+| `"obs"` | pose head + imp head, style → imp head only | full obs via the shared trunk | **none** structurally; style leaks via the state |
+| `"obs_style"` | **one trunk over `[obs ; style]`, one head over all 92 dims** | full obs **and** the style label | **none** at all; the penalty is the only constraint |
+
+`"obs_style"` is the stock DeepMimic actor with the style appended to the observation — no routing, no extra heads. `pose_net` / `imp_net` are unused. *(measured: `d(q*)/d(style) = 1.63e+01`, i.e. the style reaches the targets directly, as intended for that experiment.)*
 
 ---
 
@@ -140,10 +144,11 @@ If the phase-only head cannot balance (plausible for dynamic motion — gains sc
 |---|---|---|
 | `model.pose_input` | `"phase"` | See the table above |
 | `model.pose_net` | `actor_net` | Pose head net, only used when `pose_input: "phase"` |
-| `model.imp_net` | `actor_net` | Impedance head net, input is `[trunk features ; style one-hot]` |
-| `pose_style_reg_weight` | `0.0` | Soft invariance penalty. Only meaningful with `pose_input: "obs"` |
+| `model.imp_net` | `actor_net` | Impedance head net, unused when `pose_input: "obs_style"` |
+| `pose_style_reg_weight` | `0.0` | Soft invariance penalty. Pointless with `"phase"`, the whole mechanism with `"obs_style"` |
 | `pose_style_reg_bins` | `20` | Phase bins for that penalty |
 | `pose_style_reg_min_count` | `2` | Minimum samples for a `(bin, style)` cell to count |
+| `pose_style_reg_normalize` | `True` | Divide the per-dim cross-style variance by that dim's total variance |
 
 ### Action layout *(derived, SMPL)*
 
@@ -201,17 +206,35 @@ With `pose_input: "phase"`, `q*` can only express what the phase encoding resolv
 
 ---
 
+## The soft constraint (experiment 2)
+
+Penalty on the pd targets, added to the actor loss. `_calc_pose_style_var()` bins the batch by phase and, per output dim, takes the variance across the per-`(bin, style)` mean targets, averaged over bins that hold at least two styles. Returns `None` when no bin qualifies, and the penalty is then skipped rather than contributing a bogus number.
+
+```
+loss = mean_d [ cross_style_var_d / total_var_d ]        (normalize: True)
+     = sum_d    cross_style_var_d                        (normalize: False)
+```
+
+**What normalization buys** *(measured on synthetic targets)*: wide-range joints stop dominating, and the loss lands on the same `[0, ~1]` scale as `pose_style_ratio`, so the weight carries over between motions. Style-dependent targets score `1.03`, phase-only targets `1.5e-03` — a ~670× separation.
+
+**What it does not buy — verified, this was initially claimed and is false.** Collapsing `q*` to a constant zeroes the numerator *and* the denominator, so the ratio goes to 0 exactly like the raw variance does: `collapse = 0.0` vs `good = 1.5e-03`. **Both forms reward a policy that stops moving.** Only the tracking reward pushes back. `pose_var` is logged to detect it.
+
+**The penalty needs many styles per minibatch.** It compares styles *within* a phase bin, so a minibatch must contain several styles at the same phase. With few envs, or with `num_bins` set high relative to the batch, most cells fall below `min_count` and the penalty silently does nothing. Check that `pose_style_reg_loss` actually appears in the logs.
+
+---
+
 ## Diagnostics
 
 Logged every iteration by `StyleImpAgent._diag_impedance()`.
 
 | Metric | Reads | Bad sign |
 |---|---|---|
-| `pose_style_ratio` | cross-style variance of `q*` inside a phase bin ÷ its variance over the motion | rising — style is leaking into the targets |
+| `pose_style_ratio` | cross-style variance of `q*` inside a phase bin ÷ its total variance, per dim | rising — style is leaking into the targets |
+| `pose_var` | mean per-dim variance of `q*` | falling toward 0 — the policy bought invariance by standing still |
 | `gain_at_bound` | fraction of gain actions within 1% of `±ln R` | → 1, the policy just wants the stiffest character allowed |
 | `gain_mean_abs` | mean magnitude of the log multiplier | → 0, the impedance is carrying nothing |
 
-With `pose_input: "phase"`, `pose_style_ratio` is 0 by construction — it is only informative in `"obs"` mode.
+With `pose_input: "phase"`, `pose_style_ratio` is 0 by construction — it is only informative in `"obs"` and `"obs_style"` mode. **Read it together with `pose_var`**: a ratio that improves while `pose_var` collapses is not a success.
 
 ---
 
@@ -233,7 +256,11 @@ Three outcomes: rank-1 fails → gain modulation cannot express the style at any
 
 **E2** — single motion, learn `q*` and gains jointly, no disentanglement. Does variable impedance train at all, and does `gain_at_bound` stay off 1? Start with `impedance_range: 1.5`, then widen to 4.
 
-**E3** — multi-style with `pose_input: "phase"`. If it cannot balance, switch to `"obs"` and sweep `pose_style_reg_weight` (0 → 0.1 → 1 → 10). **Keep the `"obs"` + weight 0 run** — demonstrating that the degenerate solution actually happens is itself a result.
+**E3 — structural.** Multi-style with `pose_input: "phase"`. Invariance is exact and free; the risk is that a pose path with no state feedback cannot balance.
+
+**E3b — soft, no structure.** `pose_input: "obs_style"`: stock DeepMimic actor with the style appended, and the penalty as the *only* constraint. Strictly weaker prior than E3 and a strictly harder test — the style label reaches `q*` directly here, so nothing but the penalty stops style-specific targets. Sweep `pose_style_reg_weight` (0 → 0.1 → 1 → 10) and plot reward against `pose_style_ratio`; the interesting output is that trade-off curve, not a single run. **Keep the weight-0 run** — showing that the degenerate solution actually happens is itself a result, and it is the only baseline that makes the other points mean anything.
+
+Between the two there is a third rung, `pose_input: "obs"` + penalty: the style *label* is routed away but the state still leaks. Useful if E3b's curve is bad and E3 will not stand, since it stacks the partial structural prior with the penalty.
 
 **E4 — the real evaluation.** Swap style A's rollout gains for style B's: does the style swap? Interpolate the style one-hot: are the intermediates plausible? *(the model supports interpolation — verified)* If swapping gains does not swap style, the factorization failed regardless of the reward curve.
 
@@ -260,12 +287,14 @@ For the frozen-`q*` transfer variant (train on A, then re-learn only the impedan
 ```
 mimickit/learning/style_imp_model.py     two-lane actor
 mimickit/learning/style_imp_agent.py     PPO subclass, style plumbing, diagnostics, penalty
-data/agents/style_imp_smpl_agent.yaml
-data/envs/style_imp_smpl_env.yaml
+data/agents/style_imp_smpl_agent.yaml            experiment 1: pose_input "phase"
+data/agents/style_imp_soft_smpl_agent.yaml       experiment 2: pose_input "obs_style" + penalty
+data/envs/style_imp_smpl_env.yaml                shared by both
 data/envs/{amp,deepmimic}_smpl_imp_env.yaml     single-motion impedance configs
 data/engines/isaac_lab_pd_engine.yaml
 data/datasets/dataset_smpl_happyfeet_styles.yaml
 args/style_imp_smpl_args.txt
+args/style_imp_soft_smpl_args.txt
 args/{amp_smpl_imp,deepmimic_smpl_imp_ppo}_args.txt
 ```
 
@@ -283,6 +312,7 @@ mimickit/learning/agent_builder.py       "StyleImp" registration
 ## Running
 
 ```bash
-python mimickit/run.py --arg_file args/style_imp_smpl_args.txt          # multi-style factorization
+python mimickit/run.py --arg_file args/style_imp_smpl_args.txt           # exp 1: structural (phase-only q*)
+python mimickit/run.py --arg_file args/style_imp_soft_smpl_args.txt      # exp 2: penalty only
 python mimickit/run.py --arg_file args/deepmimic_smpl_imp_ppo_args.txt  # single motion, impedance only
 ```

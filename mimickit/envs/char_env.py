@@ -14,13 +14,25 @@ import util.torch_util as torch_util
 
 import engines.engine as engine
 
+class ImpedanceMode(enum.Enum):
+    none = 0
+    coupled = 1   # one gain scale per joint, nominal kd/kp ratio is preserved
+    decoupled = 2 # separate kp and kd scale per joint
+
 class CharEnv(sim_env.SimEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
         self._global_obs = env_config["global_obs"]
         self._root_height_obs = env_config.get("root_height_obs", True)
         self._zero_center_action = env_config.get("zero_center_action", False)
         self._obs_version = env_config.get("obs_version", "v1")
-        
+        self._impedance_mode = ImpedanceMode[env_config.get("impedance_mode", "none")]
+        self._impedance_range = env_config.get("impedance_range", 4.0)
+        self._multi_dof_pd = env_config.get("multi_dof_pd", False)
+        # gain per dof instead of per joint, lets the axes of a spherical joint differ
+        self._impedance_per_dof = env_config.get("impedance_per_dof", False)
+        # control steps between gain printouts in test mode, 0 disables the printout
+        self._impedance_print_int = env_config.get("impedance_print_int", 30)
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize, 
                          record_video=record_video)
@@ -121,6 +133,9 @@ class CharEnv(sim_env.SimEnv):
         return
     
     def _build_action_space(self):
+        # runs after initialize_sim, so the gains from the character file can be read here
+        self._build_impedance_params()
+
         control_mode = self._engine.get_control_mode()
 
         if (control_mode == engine.ControlMode.none):
@@ -143,16 +158,155 @@ class CharEnv(sim_env.SimEnv):
         else:
             assert(False), "Unsupported control mode: {}".format(control_mode)
         
-        # check to make sure that pd_explicit is only used for 1D joints
-        if (control_mode == engine.ControlMode.pd_explicit):
+        # check to make sure that pd_explicit is only used for 1D joints. characters whose
+        # spherical joints are simulated as a chain of hinges get the same per-dof PD either
+        # way, so they can opt out with multi_dof_pd
+        if (control_mode == engine.ControlMode.pd_explicit and not self._multi_dof_pd):
             num_joints = self._kin_char_model.get_num_joints()
             for j in range(1, num_joints):
                 j_dim = self._kin_char_model.get_joint_dof_dim(j)
-                assert(j_dim <= 1), "pd_explicit only supports 1D joints"
+                assert(j_dim <= 1), "pd_explicit only supports 1D joints, set multi_dof_pd to override"
+
+        low, high = self._append_impedance_bounds(low, high)
 
         action_space = spaces.Box(low=low, high=high)
         return action_space
-    
+
+    def get_pose_action_size(self):
+        return self._kin_char_model.get_dof_size()
+
+    def get_impedance_action_size(self):
+        return self._get_num_impedance_actions()
+
+    def _build_impedance_params(self):
+        self._num_impedance_joints = 0
+        self._num_impedance_gains = 0
+        self._impedance_dof_ids = None
+        self._kp_nom = None
+        self._kd_nom = None
+
+        if (self._impedance_mode == ImpedanceMode.none):
+            return
+
+        assert(self._engine.supports_variable_gains()), \
+            "impedance_mode requires an engine and control mode that support variable PD gains"
+        assert(self._impedance_range > 1.0), "impedance_range must be greater than 1"
+
+        # map every dof to the joint it belongs to, so that a per-joint gain scale can be
+        # broadcast over the dofs of that joint
+        dof_size = self._kin_char_model.get_dof_size()
+        dof_ids = torch.zeros([dof_size], device=self._device, dtype=torch.long)
+        num_joints = self._kin_char_model.get_num_joints()
+        joint_count = 0
+
+        # first dof of each impedance joint and its name, used to report the gains
+        joint_dof0 = []
+        joint_names = []
+
+        for j in range(1, num_joints):
+            j_dof_dim = self._kin_char_model.get_joint_dof_dim(j)
+            if (j_dof_dim > 0):
+                j_dof_idx = self._kin_char_model.get_joint_dof_idx(j)
+                dof_ids[j_dof_idx:j_dof_idx + j_dof_dim] = joint_count
+                joint_count += 1
+
+                joint_dof0.append(j_dof_idx)
+                joint_names.append(self._kin_char_model.get_body_name(j))
+
+        if (self._impedance_per_dof):
+            # every dof gets its own gain, so the axes of a spherical joint can be scaled by
+            # different amounts and the joint deviates from the pd target in a direction the
+            # policy picks, instead of only by an amount along the direction the load sets
+            dof_ids = torch.arange(dof_size, device=self._device, dtype=torch.long)
+            self._num_impedance_gains = dof_size
+        else:
+            self._num_impedance_gains = joint_count
+
+        self._impedance_dof_ids = dof_ids
+        self._num_impedance_joints = joint_count
+        self._impedance_joint_dof0 = torch.tensor(joint_dof0, device=self._device, dtype=torch.long)
+        self._impedance_joint_names = joint_names
+        self._impedance_print_count = 0
+
+        # cache the gains from the character file, they are the reference the policy modulates
+        char_id = self._get_char_id()
+        kp_nom, kd_nom = self._engine.get_obj_pd_gains(0, char_id)
+        self._kp_nom = torch.tensor(kp_nom, device=self._device, dtype=torch.float32)
+        self._kd_nom = torch.tensor(kd_nom, device=self._device, dtype=torch.float32)
+        assert((self._kp_nom > 0).all()), "variable impedance requires non-zero nominal gains"
+
+        Logger.print("Variable impedance: {:s}, {:d} joints, {:d} gain actions, range [1/{:.1f}, {:.1f}]x\n".format(
+            self._impedance_mode.name, self._num_impedance_joints,
+            self._get_num_impedance_actions(), self._impedance_range, self._impedance_range))
+        return
+
+    def _get_num_impedance_actions(self):
+        if (self._impedance_mode == ImpedanceMode.none):
+            num_actions = 0
+        elif (self._impedance_mode == ImpedanceMode.coupled):
+            num_actions = self._num_impedance_gains
+        elif (self._impedance_mode == ImpedanceMode.decoupled):
+            num_actions = 2 * self._num_impedance_gains
+        else:
+            assert(False), "Unsupported impedance mode: {}".format(self._impedance_mode)
+        return num_actions
+
+    def _append_impedance_bounds(self, low, high):
+        num_actions = self._get_num_impedance_actions()
+        if (num_actions == 0):
+            return low, high
+
+        # the gains are log-scale multipliers of the nominal gains, so the middle of the action
+        # range maps to 1x nominal and a zero-centered policy starts out at the original gains
+        gain_bound = np.log(self._impedance_range)
+        gain_low = np.full([num_actions], -gain_bound, dtype=np.float32)
+        gain_high = np.full([num_actions], gain_bound, dtype=np.float32)
+
+        low = np.concatenate([low, gain_low])
+        high = np.concatenate([high, gain_high])
+        return low, high
+
+    def _calc_impedance(self, gain_action):
+        if (self._impedance_mode == ImpedanceMode.coupled):
+            kp_scale = torch.exp(gain_action)
+            kd_scale = kp_scale
+        else:
+            num_gains = self._num_impedance_gains
+            kp_scale = torch.exp(gain_action[..., :num_gains])
+            kd_scale = torch.exp(gain_action[..., num_gains:])
+
+        dof_ids = self._impedance_dof_ids
+        kp = self._kp_nom * kp_scale[..., dof_ids]
+        kd = self._kd_nom * kd_scale[..., dof_ids]
+
+        # floor the damping to keep the PD stable if the gains are integrated explicitly
+        kd = torch.maximum(kd, kp * self._engine.get_sim_timestep())
+        return kp, kd
+
+    def _print_impedance(self, kp, kd):
+        # kp/kd are per-dof, report one row per joint since the gain scale is per-joint
+        dof0 = self._impedance_joint_dof0
+        kp_j = kp[0, dof0]
+        kd_j = kd[0, dof0]
+        kp_scale = kp_j / self._kp_nom[dof0]
+        kd_scale = kd_j / self._kd_nom[dof0]
+
+        kp_j = kp_j.cpu().numpy()
+        kd_j = kd_j.cpu().numpy()
+        kp_scale = kp_scale.cpu().numpy()
+        kd_scale = kd_scale.cpu().numpy()
+
+        lines = ["PD gains (env 0, {:s}, step {:d}), kp scale: min {:.2f} mean {:.2f} max {:.2f}".format(
+            self._impedance_mode.name, self._impedance_print_count,
+            kp_scale.min(), kp_scale.mean(), kp_scale.max())]
+
+        for i, name in enumerate(self._impedance_joint_names):
+            lines.append("  {:<10s} kp {:8.2f} ({:.2f}x)   kd {:7.2f} ({:.2f}x)".format(
+                name, kp_j[i], kp_scale[i], kd_j[i], kd_scale[i]))
+
+        Logger.print("\n".join(lines))
+        return
+
     def _build_action_bounds_none(self):
         char_id = self._get_char_id()
         dof_pos = self._engine.get_dof_pos(char_id)
@@ -358,6 +512,20 @@ class CharEnv(sim_env.SimEnv):
     def _apply_action(self, actions):
         char_id = self._get_char_id()
         clip_action = torch.minimum(torch.maximum(actions, self._action_bound_low), self._action_bound_high)
+
+        if (self._impedance_mode != ImpedanceMode.none):
+            dof_size = self._kin_char_model.get_dof_size()
+            gain_action = clip_action[..., dof_size:]
+            clip_action = clip_action[..., :dof_size]
+
+            kp, kd = self._calc_impedance(gain_action)
+            self._engine.set_gains(char_id, kp, kd)
+
+            if (self._mode == base_env.EnvMode.TEST and self._impedance_print_int > 0):
+                if (self._impedance_print_count % self._impedance_print_int == 0):
+                    self._print_impedance(kp, kd)
+                self._impedance_print_count += 1
+
         self._engine.set_cmd(char_id, clip_action)
         return
     

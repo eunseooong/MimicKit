@@ -1,0 +1,9 @@
+engine_name: "isaac_lab"
+
+# maps to IdealPDActuator, which evaluates the PD in torch and keeps kp/kd in gpu buffers.
+# use this for variable impedance: the implicit actuator of control_mode "pos" keeps its gains
+# in PhysX and every gain update copies the whole buffer to the cpu.
+control_mode: "pos"
+control_freq: 30
+sim_freq: 120
+env_spacing: 5

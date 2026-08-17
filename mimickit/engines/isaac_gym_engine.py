@@ -215,7 +215,19 @@ class IsaacGymEngine(engine.Engine):
             obj_cmd = self._obj_dof_cmd[obj_id]
             obj_cmd[:] = cmd
         return
-    
+
+    def set_gains(self, obj_id, kp, kd):
+        if (self._has_dof()):
+            # these are views into _kp_raw/_kd_raw, which _calc_pd_explicit_torque reads
+            self._obj_kp[obj_id][:] = kp
+            self._obj_kd[obj_id][:] = kd
+        return
+
+    def supports_variable_gains(self):
+        # in pos mode the gains live in the PhysX dof properties, which can only be changed
+        # through per-actor CPU calls, so the torque has to be computed explicitly instead
+        return (self._control_mode == engine.ControlMode.pd_explicit)
+
     def set_camera_pose(self, pos, look_at):
         self._gym.viewer_camera_look_at(self._viewer, None, 
                                       gymapi.Vec3(pos[0], pos[1], pos[2]),

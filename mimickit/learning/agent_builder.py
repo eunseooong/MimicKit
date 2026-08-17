@@ -17,6 +17,9 @@ def build_agent(agent_file, env, device):
     elif (agent_name == "PPO"):
         import learning.ppo_agent as ppo_agent
         agent = ppo_agent.PPOAgent(config=agent_config, env=env, device=device)
+    elif (agent_name == "StyleImp"):
+        import learning.style_imp_agent as style_imp_agent
+        agent = style_imp_agent.StyleImpAgent(config=agent_config, env=env, device=device)
     elif (agent_name == "AWR"):
         import learning.awr_agent as awr_agent
         agent = awr_agent.AWRAgent(config=agent_config, env=env, device=device)

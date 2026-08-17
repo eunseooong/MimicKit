@@ -41,6 +41,13 @@ class Engine:
     def set_cmd(self, obj_id, cmd):
         return
 
+    def set_gains(self, obj_id, kp, kd):
+        assert(False), "Variable PD gains are not supported by this engine"
+        return
+
+    def supports_variable_gains(self):
+        return False
+
     @abc.abstractmethod
     def step(self):
         return

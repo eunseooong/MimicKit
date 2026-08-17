@@ -1,0 +1,48 @@
+agent_name: "StyleImp"
+
+model:
+  # "phase": pose head sees only the phase -> pd targets are exactly equal across styles.
+  # "obs":   pose head sees the obs through the trunk -> style CAN leak in via the state,
+  #          only use it together with pose_style_reg_weight below.
+  pose_input: "phase"
+  pose_net: "fc_2layers_512units"      # pose head, phase encoding -> pd targets
+  actor_net: "fc_2layers_1024units"   # trunk over the observation, feeds the impedance head
+  imp_net: "fc_2layers_256units"      # impedance head, takes [trunk features ; style one-hot]
+  actor_init_output_scale: 0.01
+  actor_std_type: "FIXED"
+  action_std: 0.05
+
+  critic_net: "fc_2layers_1024units"
+
+actor_optimizer:
+    type: "Adam"
+    learning_rate: 1e-4
+
+critic_optimizer:
+    type: "Adam"
+    learning_rate: 1e-4
+
+discount: 0.99
+steps_per_iter: 32
+iters_per_output: 100
+test_episodes: 32
+normalizer_samples: 100000000
+use_mixed_precision: false
+
+actor_epochs: 5
+actor_batch_size: 4
+critic_epochs: 2
+critic_batch_size: 2
+
+td_lambda: 0.95
+ppo_clip_ratio: 0.2
+norm_adv_clip: 4.0
+action_bound_weight: 10.0
+action_entropy_weight: 0.0
+action_reg_weight: 0.0
+
+# soft invariance penalty on the pd targets, only needed when pose_input is "obs".
+# penalizes the cross-style spread of the targets inside a phase bin.
+pose_style_reg_weight: 0.0
+pose_style_reg_bins: 20
+pose_style_reg_min_count: 2

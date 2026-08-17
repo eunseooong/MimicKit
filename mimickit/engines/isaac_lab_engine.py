@@ -196,7 +196,32 @@ class IsaacLabEngine(engine.Engine):
         else:
             assert(False), "Unsupported control mode: {}".format(self._control_mode)
         return
-    
+
+    def set_gains(self, obj_id, kp, kd):
+        obj = self._objs[obj_id]
+        dof_order_common2sim = self._dof_order_common2sim[obj_id]
+        sim_kp = kp[:, dof_order_common2sim]
+        sim_kd = kd[:, dof_order_common2sim]
+
+        if (self._control_mode == engine.ControlMode.pos):
+            # implicit actuators keep their gains inside PhysX, so they have to go through the
+            # articulation view. note that write_joint_*_to_sim copies the full gain buffer to
+            # the cpu on every call, which stalls the pipeline once per control step
+            obj.write_joint_stiffness_to_sim(sim_kp)
+            obj.write_joint_damping_to_sim(sim_kd)
+        else:
+            # explicit actuators evaluate the PD in torch, so the gains are plain gpu buffers
+            actuator = obj.actuators["actuators"]
+            actuator.stiffness[:] = sim_kp
+            actuator.damping[:] = sim_kd
+        return
+
+    def supports_variable_gains(self):
+        # see _build_actuator_cfg: pos maps to an implicit actuator (gains in PhysX) and
+        # pd_explicit to an ideal PD actuator (gains in torch)
+        return (self._control_mode == engine.ControlMode.pos
+                or self._control_mode == engine.ControlMode.pd_explicit)
+
     def set_camera_pose(self, pos, look_at):
         env_offset = self._env_offsets[0].cpu().numpy()
         cam_pos = pos.copy()

@@ -8,6 +8,7 @@ import envs.char_env as char_env
 import engines.engine as engine
 import util.stats_tracker as stats_tracker
 import util.torch_util as torch_util
+from util.logger import Logger
 
 class DeepMimicEnv(char_env.CharEnv):
     def __init__(self, env_config, engine_config, num_envs, device, visualize, record_video=False):
@@ -38,10 +39,72 @@ class DeepMimicEnv(char_env.CharEnv):
         self._reward_key_pos_scale = env_config.get("reward_key_pos_scale")
         
         self._visualize_ref_char = env_config.get("visualize_ref_char", True)
-        
+
+        # maps each loaded motion to a style index, defaults to one style per motion
+        self._style_ids_config = env_config.get("style_ids", None)
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
+
+        self._build_styles()
+        return
+
+    def get_num_styles(self):
+        return self._num_styles
+
+    def get_style_ids(self, env_ids=None):
+        style_ids = self._motion_style_ids[self._motion_ids]
+        if (env_ids is not None):
+            style_ids = style_ids[env_ids]
+        return style_ids
+
+    def get_motion_phase(self, env_ids=None):
+        motion_ids = self._motion_ids
+        motion_times = self._get_motion_times(env_ids)
+        if (env_ids is not None):
+            motion_ids = motion_ids[env_ids]
+        return self._motion_lib.calc_motion_phase(motion_ids, motion_times)
+
+    def get_phase_obs_size(self):
+        return 1 + 2 * self._num_phase_encoding
+
+    def get_phase_obs_range(self):
+        """Index range of the phase encoding inside the observation. The phase is the only part
+        of the observation that is shared across styles at a given point in the motion, so a head
+        that must be style invariant can be restricted to this slice."""
+        assert(self._enable_phase_obs), "phase obs must be enabled to locate the phase in the obs"
+        assert(not self._enable_tar_obs), \
+            "tar obs must be disabled so the phase encoding is the tail of the obs, and because " \
+            "the target pose is style specific and would leak the style"
+
+        obs_size = int(np.prod(self.get_obs_space().shape))
+        phase_size = self.get_phase_obs_size()
+        return obs_size - phase_size, obs_size
+
+    def get_style_onehot(self, env_ids=None):
+        style_ids = self.get_style_ids(env_ids)
+        onehot = torch.nn.functional.one_hot(style_ids, self._num_styles)
+        return onehot.type(torch.float32)
+
+    def _build_styles(self):
+        num_motions = self._motion_lib.get_num_motions()
+
+        if (self._style_ids_config is None):
+            style_ids = list(range(num_motions))
+        else:
+            style_ids = self._style_ids_config
+            assert(len(style_ids) == num_motions), \
+                "style_ids has {:d} entries but {:d} motions were loaded".format(len(style_ids), num_motions)
+
+        self._motion_style_ids = torch.tensor(style_ids, device=self._device, dtype=torch.long)
+        self._num_styles = int(self._motion_style_ids.max().item()) + 1
+
+        # every style has to be reachable, otherwise the one-hot has a column that is never set
+        seen = torch.unique(self._motion_style_ids)
+        assert(len(seen) == self._num_styles), "style_ids must cover 0..num_styles-1 without gaps"
+
+        Logger.print("Loaded {:d} motions covering {:d} styles\n".format(num_motions, self._num_styles))
         return
     
     def get_reward_succ(self):

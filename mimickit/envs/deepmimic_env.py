@@ -40,6 +40,10 @@ class DeepMimicEnv(char_env.CharEnv):
         
         self._visualize_ref_char = env_config.get("visualize_ref_char", True)
 
+        # ref char while recording a video. recording always runs headless, so it needs its
+        # own switch. defaults to the viewer setting.
+        self._record_ref_char = env_config.get("record_ref_char", self._visualize_ref_char)
+
         # maps each loaded motion to a style index, defaults to one style per motion
         self._style_ids_config = env_config.get("style_ids", None)
 
@@ -229,10 +233,15 @@ class DeepMimicEnv(char_env.CharEnv):
         return
     
     def _enable_ref_char(self):
-        # recording runs headless, so the ref char has to be enabled for it as well,
-        # otherwise videos come out without the reference motion
-        show_char = self._visualize or self._engine.enabled_record_video()
-        return show_char and self._visualize_ref_char
+        if (self._visualize):
+            return self._visualize_ref_char
+
+        # recording runs headless, so it is gated separately, otherwise videos always come
+        # out without the reference motion
+        if (self._engine.enabled_record_video()):
+            return self._record_ref_char
+
+        return False
 
     def _get_ref_char_color(self):
         engine_name = self._engine.get_name()

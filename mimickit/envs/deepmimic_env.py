@@ -43,11 +43,16 @@ class DeepMimicEnv(char_env.CharEnv):
         # maps each loaded motion to a style index, defaults to one style per motion
         self._style_ids_config = env_config.get("style_ids", None)
 
+        # pins a motion to each env during test, assigned in env order and repeated.
+        # empty or omitted -> motions are sampled randomly, same as during training.
+        self._test_motion_ids_config = env_config.get("test_motion_ids", [])
+
         super().__init__(env_config=env_config, engine_config=engine_config,
                          num_envs=num_envs, device=device, visualize=visualize,
                          record_video=record_video)
 
         self._build_styles()
+        self._build_test_motion_ids()
         return
 
     def get_num_styles(self):
@@ -106,7 +111,32 @@ class DeepMimicEnv(char_env.CharEnv):
 
         Logger.print("Loaded {:d} motions covering {:d} styles\n".format(num_motions, self._num_styles))
         return
-    
+
+    def _build_test_motion_ids(self):
+        motion_ids = self._test_motion_ids_config
+
+        if (motion_ids is None or len(motion_ids) == 0):
+            self._test_motion_ids = None
+            return
+
+        num_motions = self._motion_lib.get_num_motions()
+        for motion_id in motion_ids:
+            assert(0 <= motion_id and motion_id < num_motions), \
+                "test_motion_ids entry {:d} is out of range for {:d} loaded motions".format(motion_id, num_motions)
+
+        self._test_motion_ids = torch.tensor(motion_ids, device=self._device, dtype=torch.int64)
+        Logger.print("Test motions pinned per env, cycling through {}\n".format(list(motion_ids)))
+        return
+
+    def _get_test_motion_ids(self, env_ids):
+        """Motion assigned to each env during test: env i always plays
+        test_motion_ids[i % len], instead of drawing a random motion. Returns None when
+        the option is unset or the env is training, so sampling stays random."""
+        if (self._mode != base_env.EnvMode.TEST or self._test_motion_ids is None):
+            return None
+
+        return self._test_motion_ids[env_ids % len(self._test_motion_ids)]
+
     def get_reward_succ(self):
         # setting the success reward to 0 at the end of the motion avoids the
         # local minimal of a character just standing still until the end of the motion
@@ -199,7 +229,10 @@ class DeepMimicEnv(char_env.CharEnv):
         return
     
     def _enable_ref_char(self):
-        return self._visualize and self._visualize_ref_char
+        # recording runs headless, so the ref char has to be enabled for it as well,
+        # otherwise videos come out without the reference motion
+        show_char = self._visualize or self._engine.enabled_record_video()
+        return show_char and self._visualize_ref_char
 
     def _get_ref_char_color(self):
         engine_name = self._engine.get_name()
@@ -238,6 +271,12 @@ class DeepMimicEnv(char_env.CharEnv):
     def _reset_ref_motion(self, env_ids):
         n = len(env_ids)
         motion_ids, motion_times = self._sample_motion_times(n)
+
+        test_motion_ids = self._get_test_motion_ids(env_ids)
+        if (test_motion_ids is not None):
+            motion_ids = test_motion_ids
+            motion_times = self._sample_times(motion_ids)
+
         self._motion_ids[env_ids] = motion_ids
         self._motion_time_offsets[env_ids] = motion_times
 
@@ -339,13 +378,18 @@ class DeepMimicEnv(char_env.CharEnv):
 
     def _sample_motion_times(self, n):
         motion_ids = self._motion_lib.sample_motions(n)
+        motion_times = self._sample_times(motion_ids)
+        return motion_ids, motion_times
 
+    def _sample_times(self, motion_ids):
+        # start times depend on the length of the motion, so they have to be drawn for
+        # the motions that are actually used
         if (self._rand_reset):
             motion_times = self._motion_lib.sample_time(motion_ids)
         else:
-            motion_times = torch.zeros(n, dtype=torch.float, device=self._device)
+            motion_times = torch.zeros(len(motion_ids), dtype=torch.float, device=self._device)
 
-        return motion_ids, motion_times
+        return motion_times
 
     def _build_data_buffers(self):
         super()._build_data_buffers()

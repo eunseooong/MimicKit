@@ -67,3 +67,6 @@ class BaseEnv(abc.ABC):
     
     def record_diagnostics(self):
         return self._diagnostics
+
+    def close(self):
+        return

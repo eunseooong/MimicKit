@@ -48,13 +48,27 @@ def train(agent, max_samples, out_dir, save_int_models, logger_type):
                       save_int_models=save_int_models, logger_type=logger_type)
     return
 
-def test(agent, test_episodes):
+def test(agent, env, test_episodes, out_dir):
     result = agent.test_model(num_episodes=test_episodes)
-    
+
     Logger.print("Mean Return: {}".format(result["mean_return"]))
     Logger.print("Mean Episode Length: {}".format(result["mean_ep_len"]))
     Logger.print("Episodes: {}".format(result["num_eps"]))
+
+    save_video(env, out_dir)
     return result
+
+def save_video(env, out_dir):
+    # only populated when the env was built with --video true
+    recording = env.record_diagnostics().get("sim_recording", None)
+    if (recording is None or recording.get_num_frames() == 0):
+        return
+
+    if (mp_util.is_root_proc()):
+        video_file = os.path.join(out_dir, "video.mp4")
+        recording.save(video_file)
+        Logger.print("Saved video to: {}".format(video_file))
+    return
 
 def save_config_files(args, out_dir):
     engine_file = args.parse_string("engine_config")
@@ -117,17 +131,22 @@ def run(rank, num_procs, device, master_port, args):
     if (model_file != ""):
         agent.load(model_file)
 
-    if (mode == "train"):
-        save_config_files(args, out_dir)
-        train(agent=agent, max_samples=max_samples, out_dir=out_dir, 
-              save_int_models=save_int_models, logger_type=logger_type)
-        
-    elif (mode == "test"):
-        test_episodes = args.parse_int("test_episodes", np.iinfo(np.int64).max)
-        test(agent=agent, test_episodes=test_episodes)
+    try:
+        if (mode == "train"):
+            save_config_files(args, out_dir)
+            train(agent=agent, max_samples=max_samples, out_dir=out_dir,
+                  save_int_models=save_int_models, logger_type=logger_type)
 
-    else:
-        assert(False), "Unsupported mode: {}".format(mode)
+        elif (mode == "test"):
+            test_episodes = args.parse_int("test_episodes", np.iinfo(np.int64).max)
+            test(agent=agent, env=env, test_episodes=test_episodes, out_dir=out_dir)
+
+        else:
+            assert(False), "Unsupported mode: {}".format(mode)
+    finally:
+        # shut the simulator down explicitly, otherwise the implicit teardown at
+        # interpreter exit can hang (and ignore ctrl-c)
+        env.close()
 
     return
 

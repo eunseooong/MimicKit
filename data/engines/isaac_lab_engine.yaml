@@ -4,3 +4,6 @@ control_mode: "pos"
 control_freq: 30
 sim_freq: 120
 env_spacing: 5
+
+# resolution used by --video recording. must be even for h264 encoding.
+video_resolution: [1920, 1080]

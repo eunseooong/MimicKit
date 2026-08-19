@@ -100,7 +100,8 @@ class IsaacLabEngine(engine.Engine):
 
         if (record_video):
             self._recording = False
-            self._build_video_recorder()
+            video_res = config.get("video_resolution", [854, 480])
+            self._build_video_recorder(tuple(video_res))
         
         return
     
@@ -1262,7 +1263,20 @@ class IsaacLabEngine(engine.Engine):
                 callback()
         return
 
-    def _build_video_recorder(self):
-        self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self)
-        Logger.print("Video recording enabled")
+    def close(self):
+        """Shut down the kit app.
+
+        Without this the app is torn down implicitly when the interpreter exits, which
+        can hang on plugin unload (and ignores ctrl-c, since the hang is inside kit's
+        native shutdown rather than python).
+        """
+        if (self.enabled_record_video()):
+            self._video_recorder.close()
+
+        self._app_launcher.app.close()
+        return
+
+    def _build_video_recorder(self, resolution):
+        self._video_recorder = isaac_lab_recorder.IsaacLabVideoRecorder(self, resolution=resolution)
+        Logger.print("Video recording enabled ({}x{})".format(resolution[0], resolution[1]))
         return

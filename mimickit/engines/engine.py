@@ -80,6 +80,9 @@ class Engine:
     def get_timestep(self):
         return 0.0
     
+    def close(self):
+        return
+
     @abc.abstractmethod
     def get_num_envs(self):
         return 0

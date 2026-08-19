@@ -53,6 +53,29 @@ class IsaacLabVideoRecorder(video_recorder.VideoRecorder):
 
         return frame
     
+    def close(self):
+        """Tear down the replicator graph.
+
+        The annotator keeps OmniGraph nodes alive. If they are still attached when the
+        app shuts down, kit unloads the replicator plugins while the nodes still
+        reference them, which spams "Could not find category 'Replicator...' for
+        removal" and then hangs on plugin unload.
+        """
+        if (self._annotator is not None):
+            try:
+                self._annotator.detach([self._render_product])
+            except Exception as e:
+                Logger.print("[VideoRecorder] Failed to detach annotator: {}".format(e))
+            self._annotator = None
+
+        if (self._render_product is not None):
+            try:
+                self._render_product.destroy()
+            except Exception as e:
+                Logger.print("[VideoRecorder] Failed to destroy render product: {}".format(e))
+            self._render_product = None
+        return
+
     def _build_annotator(self):
         import omni.replicator.core as rep
 

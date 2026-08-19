@@ -125,6 +125,7 @@ class StyleImpModel(ppo_model.PPOModel):
             # stock actor: one head over the whole action, nothing routed anywhere
             self._full_dist = self._build_head_dist(config, trunk_size,
                                                     self._pose_size + self._imp_size)
+            self._set_gain_std(self._full_dist, self._get_imp_action_std(config))
             return
 
         if (self._pose_input == "phase"):
@@ -150,17 +151,45 @@ class StyleImpModel(ppo_model.PPOModel):
                                                     activation=self._activation)
 
         imp_size = torch_util.calc_layers_out_size(self._imp_layers)
-        self._imp_dist = self._build_head_dist(config, imp_size, self._imp_size)
+        self._imp_dist = self._build_head_dist(config, imp_size, self._imp_size,
+                                               init_std=self._get_imp_action_std(config))
         return
 
-    def _build_head_dist(self, config, in_size, out_size):
+    def _build_head_dist(self, config, in_size, out_size, init_std=None):
         init_output_scale = config["actor_init_output_scale"]
         std_type = distribution_gaussian_diag.StdType[config["actor_std_type"]]
-        init_std = config["action_std"]
+        if (init_std is None):
+            init_std = config["action_std"]
         a_dist = distribution_gaussian_diag.DistributionGaussianDiagBuilder(
             in_size, out_size, std_type=std_type, init_std=init_std,
             init_output_scale=init_output_scale)
         return a_dist
+
+    def _get_imp_action_std(self, config):
+        """Exploration std for the gain dims, separate from the pd targets.
+
+        action_std is shared by every dim in normalized space, but a_norm gives the pd target dims a
+        scale of radians while the gain dims get ln(impedance_range). A one-sigma gain wiggle then
+        moves a joint by only lag*sigma*ln(R), where lag = |q*-q|, against sigma*pose_std for the
+        targets -- an order of magnitude less leverage on the reward, so PPO barely resolves the
+        gain channel. Widening R does not fix that: sigma_gain grows as ln(R), so equalizing would
+        need an R in the thousands and a physically nonsensical kp range. Setting the gain channel's
+        std directly decouples exploration from range. See tools/eval_style_q.py, which measures the
+        lag and prints the value to use here.
+        """
+        return config.get("imp_action_std", config["action_std"])
+
+    def _set_gain_std(self, dist, init_std):
+        """Overrides the logstd of the gain slice of a combined head, for the joint actor where the
+        pd targets and the gains share one distribution."""
+        logstd = float(np.log(init_std))
+        with torch.no_grad():
+            p = dist._logstd_net
+            if (isinstance(p, torch.nn.Linear)):
+                p.bias[self._pose_size:] = logstd
+            else:
+                p[self._pose_size:] = logstd
+        return
 
     def _build_actor_input_dict(self, env):
         input_dict = {"obs": env.get_obs_space()}

@@ -10,6 +10,12 @@ model:
   actor_init_output_scale: 0.01
   actor_std_type: "FIXED"
   action_std: 0.05
+  # exploration std for the gain dims only. action_std is shared across all dims in normalized
+  # space, but a 1-sigma gain wiggle moves a joint by lag*sigma*ln(R) while a 1-sigma q* wiggle
+  # moves it sigma*pose_std -- an order of magnitude less leverage, so PPO barely learns the gain
+  # channel. raising impedance_range does not fix it (sigma_gain only grows as ln R). run
+  # tools/eval_style_q.py to get the value to put here.
+  imp_action_std: 0.05
 
   critic_net: "fc_2layers_1024units"
 

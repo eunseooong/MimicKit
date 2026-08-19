@@ -104,6 +104,10 @@ class SimEnv(base_env.BaseEnv):
 
         diag = super().record_diagnostics()
         return diag
+
+    def close(self):
+        self._engine.close()
+        return
     
     def _pre_physics_step(self, actions):
         self._apply_action(actions)

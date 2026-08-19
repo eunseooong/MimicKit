@@ -200,7 +200,7 @@ With `pose_input: "phase"`, `q*` can only express what the phase encoding resolv
 
 **`actuator.computed_effort` / `applied_effort` go stale.** `write_joint_stiffness_to_sim` deliberately does not update the actuator model's buffers (upstream issue #128). Convenient for us — `get_obj_pd_gains()` keeps returning nominal, which is what the env caches — but any future torque penalty or energy reward that reads applied effort will be **silently wrong**. Note also `_enable_dof_force_sensors()` is hardcoded `False` in the Isaac Gym engine.
 
-**There is no gain-regularisation hook in PPO or AMP.** `action_reg_weight` is only consumed by `awr_agent` and `ase_agent`. The only pressure on the gains in `StyleImp` is `action_bound_weight: 10.0`, which is a boundary penalty — it does not stop the policy from parking just inside the limit. Watch `gain_at_bound`.
+**Two pressures act on the gains, and both are blunt.** `action_bound_weight: 10.0` only bites outside `[-1, 1]` in normalized space, so it does not stop the policy from parking just inside the limit. `action_reg_weight` *is* wired in `ppo_agent` (`_compute_actor_loss`, via `DistributionGaussianDiag.param_reg` = `sum(mean²)`) and does pull the gains toward nominal, since `g = 0` is nominal — but it applies to **all 92 action dims**, so it simultaneously pulls `q*` toward the middle of its range and flattens the motion. A gain-only regulariser would have to slice the action before squaring. Watch `gain_at_bound`.
 
 **`pose_style_ratio` must be phase-binned.** Comparing per-style means over the whole motion averages the leak away and reports a healthy number for a broken policy. `_calc_pose_style_var()` bins by phase; both the diagnostic and the penalty share it.
 
@@ -235,6 +235,30 @@ Logged every iteration by `StyleImpAgent._diag_impedance()`.
 | `gain_mean_abs` | mean magnitude of the log multiplier | → 0, the impedance is carrying nothing |
 
 With `pose_input: "phase"`, `pose_style_ratio` is 0 by construction — it is only informative in `"obs"` and `"obs_style"` mode. **Read it together with `pose_var`**: a ratio that improves while `pose_var` collapses is not a success.
+
+---
+
+## Measuring a trained model: `tools/eval_style_q.py`
+
+```bash
+python tools/eval_style_q.py --arg_file args/style_imp_soft_smpl_args.txt \
+    --model_file output/style_imp_soft/model.pt --num_envs 512 --steps 400 \
+    --num_bins 20 --out_file output/style_imp_soft/style_q.npz
+```
+
+Rolls the policy out over every style, bins the pd targets by phase, and reports how far apart the styles' targets sit. Three readings, because "how far apart" is ambiguous:
+
+| Reading | Answers |
+|---|---|
+| **on-policy** | do the styles actually share one equilibrium trajectory? This is the claim, and it is what the training penalty targets |
+| **counterfactual** | same observation, style label swapped. Isolates the *direct* label channel from the *state* channel. In `"obs_style"` both are open and only this split says which does the work; in `"phase"`/`"obs"` it is 0 by construction |
+| **vs reference** | on-policy spread ÷ the spread of the reference motions at the same phase. The interpretable number: ratio ≈ 1 means the targets differ as much as the motions do and the factorization achieved nothing; ratio ≪ 1 means the impedance is carrying the difference |
+
+Also prints a per-style-pair distance matrix (one outlier style vs a uniform spread), a per-phase-bin curve (*where* in the motion they diverge), and the worst joints (*which* joints diverge).
+
+**The metric has a noise floor, and the tool measures it for you.** A phase bin averages over a range of phases, so a fast trajectory leaves a residual even when the styles agree exactly. `within_style_floor()` splits each style's *own* samples in half and measures the spread between the halves — same binning, same sample count, zero true style effect. The report divides by it: **a signal/floor near 1 means the styles are indistinguishable in `q*`.** *(measured on synthetic data: identical styles → 1.34, a 0.01 rad offset → 4.19, a 0.30 rad offset → 114.7, so the floor resolves well below anything meaningful.)* More bins lowers the floor but empties cells.
+
+The math lives in `mimickit/util/style_metrics.py`, free of any simulator import so it can be unit tested without Isaac.
 
 ---
 
